@@ -157,11 +157,6 @@ def load_ines_file(li):
         warning("Invalid iNES signature.\n")
         return 0
 
-    if((hdr.rom_control_byte_1 & 0x0C) == 0x08):
-        warning("NES 2.0 images are not supported by this loader.\n"
-                "The header will not be modified.\n")
-        return 0
-
     # check if header is corrupt
     # show a warning msg, but load the rom nonetheless
     if(hdr.is_corrupt_ines_hdr()):
@@ -175,14 +170,18 @@ def load_ines_file(li):
         if(code == ASKBTN_YES):
             hdr.fix_ines_hdr()
 
-    if(hdr.prg_page_count_16k == 0):
+    if(hdr.prg_rom_size == 0):
         warning("A zero PRG-ROM page count is not supported by this loader.\n")
+        return 0
+
+    if(hdr.prg_rom_size % PRG_PAGE_SIZE != 0):
+        warning("The header specifies a PRG-ROM size that is not a multiple of 16K.\n"
+                "This loader's existing bank layouts cannot map that size.\n")
         return 0
 
     required_size = INES_HDR_SIZE + \
         (TRAINER_SIZE if INES_MASK_TRAINER(hdr.rom_control_byte_0) else 0) + \
-        PRG_PAGE_SIZE * hdr.prg_page_count_16k + \
-        CHR_PAGE_SIZE * hdr.chr_page_count_8k
+        hdr.prg_rom_size + hdr.chr_rom_size
     if(li.size() < required_size):
         warning("The ROM image is shorter than the sizes declared in its header.\n")
         return 0
@@ -415,13 +414,13 @@ def load_chr_rom_bank(li, banknr, address):
     msg("The loader was trying to load a CHR bank but the PPU is not supported yet.\n")
     return
 
-    if((banknr == 0) or (hdr.chr_page_count_8k == 0)):
+    if((banknr == 0) or (hdr.chr_rom_size == 0)):
         return
 
     # this is the file offset to begin reading pages from
     offset = INES_HDR_SIZE + \
         (TRAINER_SIZE if INES_MASK_TRAINER(hdr.rom_control_byte_0) else 0) + \
-        PRG_PAGE_SIZE * hdr.prg_page_count_16k + \
+        hdr.prg_rom_size + \
         (banknr - 1) * CHR_ROM_BANK_SIZE
 
     # load page from ROM file into segment
@@ -439,7 +438,7 @@ def load_chr_rom_bank(li, banknr, address):
 #
 def load_prg_rom_bank(li, banknr, address):
 
-    if not 1 <= banknr <= hdr.prg_page_count_16k:
+    if not 1 <= banknr <= hdr.prg_rom_size // PRG_ROM_BANK_SIZE:
         raise ValueError("Invalid 16K PRG-ROM bank number: %d" % banknr)
 
     # this is the file offset to begin reading pages from
@@ -462,7 +461,7 @@ def load_prg_rom_bank(li, banknr, address):
 #
 def load_8k_prg_rom_bank(li, banknr, address):
 
-    if not 1 <= banknr <= hdr.prg_page_count_16k * 2:
+    if not 1 <= banknr <= hdr.prg_rom_size // PRG_ROM_8K_BANK_SIZE:
         raise ValueError("Invalid 8K PRG-ROM bank number: %d" % banknr)
 
     # this is the file offset to begin reading pages from
@@ -485,8 +484,12 @@ def load_8k_prg_rom_bank(li, banknr, address):
 #      depending on the mapper in use
 #
 def load_rom_banks(li):
-    mapper = INES_MASK_MAPPER_VERSION(
-        hdr.rom_control_byte_0, hdr.rom_control_byte_1)
+    mapper = hdr.mapper_number
+    prg_page_count = hdr.prg_rom_size // PRG_PAGE_SIZE
+    if hdr.submapper_number:
+        warning("NES 2.0 submapper %d: using the existing layout for mapper %d.\n"
+                "Submapper-specific bank mapping is not implemented.\n" %
+                (hdr.submapper_number, mapper))
     if mapper in (MAPPER_NONE,
                   MAPPER_MMC1,
                   MAPPER_UNROM,
@@ -513,14 +516,14 @@ def load_rom_banks(li):
                   MAPPER_GNROM,
                   ):
         load_prg_rom_bank(li, 1, PRG_ROM_BANK_LOW_ADDRESS)
-        load_prg_rom_bank(li, hdr.prg_page_count_16k,
+        load_prg_rom_bank(li, prg_page_count,
                           PRG_ROM_BANK_HIGH_ADDRESS)
         load_chr_rom_bank(li, 1, CHR_ROM_BANK_ADDRESS)
 
     elif mapper == MAPPER_HK_SF3:  # last prg, last prg, 1st chr
-        load_prg_rom_bank(li, hdr.prg_page_count_16k,
+        load_prg_rom_bank(li, prg_page_count,
                           PRG_ROM_BANK_LOW_ADDRESS)
-        load_prg_rom_bank(li, hdr.prg_page_count_16k,
+        load_prg_rom_bank(li, prg_page_count,
                           PRG_ROM_BANK_HIGH_ADDRESS)
         load_chr_rom_bank(li, 1, CHR_ROM_BANK_ADDRESS)
 
@@ -534,24 +537,24 @@ def load_rom_banks(li):
         load_chr_rom_bank(li, 1, CHR_ROM_BANK_ADDRESS)
     elif mapper == MAPPER_MMC2:  # 1st 8k prg, last three 8k prgs, 1st chr
         load_8k_prg_rom_bank(li, 1, PRG_ROM_BANK_LOW_ADDRESS)
-        load_8k_prg_rom_bank(li, hdr.prg_page_count_16k *
+        load_8k_prg_rom_bank(li, prg_page_count *
                              2 - 2, PRG_ROM_BANK_A000)
-        load_prg_rom_bank(li, hdr.prg_page_count_16k,
+        load_prg_rom_bank(li, prg_page_count,
                           PRG_ROM_BANK_HIGH_ADDRESS)
         load_chr_rom_bank(li, 1, CHR_ROM_BANK_ADDRESS)
 
     elif mapper == MAPPER_TENGEN_RAMBO_1:  # last 8k prg, last 8k prg, last 8k prg, last 8k prg, 1st chr
-        load_8k_prg_rom_bank(li, hdr.prg_page_count_16k*2, PRG_ROM_BANK_8000)
-        load_8k_prg_rom_bank(li, hdr.prg_page_count_16k*2, PRG_ROM_BANK_A000)
-        load_8k_prg_rom_bank(li, hdr.prg_page_count_16k*2, PRG_ROM_BANK_C000)
-        load_8k_prg_rom_bank(li, hdr.prg_page_count_16k*2, PRG_ROM_BANK_E000)
+        load_8k_prg_rom_bank(li, prg_page_count*2, PRG_ROM_BANK_8000)
+        load_8k_prg_rom_bank(li, prg_page_count*2, PRG_ROM_BANK_A000)
+        load_8k_prg_rom_bank(li, prg_page_count*2, PRG_ROM_BANK_C000)
+        load_8k_prg_rom_bank(li, prg_page_count*2, PRG_ROM_BANK_E000)
         load_chr_rom_bank(li, 1, CHR_ROM_BANK_ADDRESS)
     else:  # 1st prg, last prg, 1st chr
         warning("Mapper %d is not supported by this loader!\n"
                 "This could be a corrupt ROM image!\n"
                 "Loading first and last PRG-ROM banks by default." % mapper)
         load_prg_rom_bank(li, 1, PRG_ROM_BANK_LOW_ADDRESS)
-        load_prg_rom_bank(li, hdr.prg_page_count_16k,
+        load_prg_rom_bank(li, prg_page_count,
                           PRG_ROM_BANK_HIGH_ADDRESS)
         load_chr_rom_bank(li, 1, CHR_ROM_BANK_ADDRESS)
 
@@ -569,9 +572,9 @@ def save_image_as_blobs(li):
         raise RuntimeError("Could not store trainer to netnode.")
 
     # store rom image in blobs
-    if not save_prg_rom_pages_as_blobs(li, hdr.prg_page_count_16k):
+    if not save_prg_rom_pages_as_blobs(li, hdr.prg_rom_size // PRG_PAGE_SIZE):
         raise RuntimeError("Could not store PRG-ROM pages to netnode.")
-    if not save_chr_rom_pages_as_blobs(li, hdr.chr_page_count_8k):
+    if not save_chr_rom_pages_as_blobs(li, hdr.chr_rom_size):
         raise RuntimeError("Could not store CHR-ROM pages to netnode.")
 
 
@@ -640,15 +643,16 @@ def save_prg_rom_pages_as_blobs(li, count):
 #
 #      store CHR ROM pages to netnode
 #
-def save_chr_rom_pages_as_blobs(li, count):
+def save_chr_rom_pages_as_blobs(li, size):
     node = ida_netnode.netnode()
 
     li.seek(INES_HDR_SIZE + (TRAINER_SIZE if INES_MASK_TRAINER(hdr.rom_control_byte_0)
-                             else 0) + PRG_PAGE_SIZE * hdr.prg_page_count_16k)
+                             else 0) + hdr.prg_rom_size)
 
-    for i in range(count):
-        buffer = li.read(CHR_PAGE_SIZE)
-        if buffer is None or len(buffer) != CHR_PAGE_SIZE:
+    for i, offset in enumerate(range(0, size, CHR_PAGE_SIZE)):
+        page_size = min(CHR_PAGE_SIZE, size - offset)
+        buffer = li.read(page_size)
+        if buffer is None or len(buffer) != page_size:
             return False
         chr_node_name = "$ CHR-ROM page %d" % i
         if(not node.create(chr_node_name)):
@@ -675,20 +679,40 @@ def get_mapper_name(mapper):
 #      add information about the ROM image to disassembly
 #
 def describe_rom_image():
-    mapper = INES_MASK_MAPPER_VERSION(
-        hdr.rom_control_byte_0, hdr.rom_control_byte_1)
+    mapper = hdr.mapper_number
 
     m_ea = idaapi.inf_get_min_ea()
 
     add_extra_line(m_ea, True, "\n;   ROM information\n"
                                      ";   ---------------\n;")
     add_extra_line(m_ea, True, ";   Valid image header      : %s" % YES_NO(not hdr.is_corrupt_ines_hdr()))
-    add_extra_line(m_ea, True, ";   16K PRG-ROM page count  : %d" % hdr.prg_page_count_16k)
-    add_extra_line(m_ea, True, ";   8K CHR-ROM page count   : %d" % hdr.chr_page_count_8k)
+    if hdr.is_nes2_hdr():
+        add_extra_line(m_ea, True, ";   Header format           : NES 2.0")
+        add_extra_line(m_ea, True, ";   PRG-ROM size (bytes)    : %d" % hdr.prg_rom_size)
+        add_extra_line(m_ea, True, ";   CHR-ROM size (bytes)    : %d" % hdr.chr_rom_size)
+        add_extra_line(m_ea, True, ";   Submapper               : %d" % hdr.submapper_number)
+        for name, shift in (("PRG-RAM", hdr.reserved[1] & 0x0F),
+                            ("PRG-NVRAM", hdr.reserved[1] >> 4),
+                            ("CHR-RAM", hdr.reserved[2] & 0x0F),
+                            ("CHR-NVRAM", hdr.reserved[2] >> 4)):
+            add_extra_line(m_ea, True, ";   %s size (bytes): %d" %
+                           (name, (64 << shift) if shift else 0))
+        add_extra_line(m_ea, True, ";   CPU timing             : %s" %
+                       ("NTSC", "PAL", "Multi-region", "Dendy")[hdr.reserved[3] & 0x03])
+        add_extra_line(m_ea, True, ";   Console type           : %d" %
+                       (hdr.rom_control_byte_1 & 0x03))
+        add_extra_line(m_ea, True, ";   Console data (byte 13) : 0x%02X" % hdr.reserved[4])
+        add_extra_line(m_ea, True, ";   Miscellaneous ROMs     : %d" % (hdr.reserved[5] & 0x03))
+        add_extra_line(m_ea, True, ";   Expansion device       : %d" % (hdr.reserved[6] & 0x3F))
+    else:
+        add_extra_line(m_ea, True, ";   16K PRG-ROM page count  : %d" % hdr.prg_page_count_16k)
+        add_extra_line(m_ea, True, ";   8K CHR-ROM page count   : %d" % hdr.chr_page_count_8k)
     add_extra_line(m_ea, True, ";   Mirroring               : %s" % (
         "horizontal" if INES_MASK_H_MIRRORING(hdr.rom_control_byte_0) else "vertical"))
     add_extra_line(m_ea, True,
-                   ";   SRAM enabled            : %s" % YES_NO(INES_MASK_SRAM(hdr.rom_control_byte_0)))
+                   ";   %-23s : %s" % (
+                       "Battery/nonvolatile" if hdr.is_nes2_hdr() else "SRAM enabled",
+                       YES_NO(INES_MASK_SRAM(hdr.rom_control_byte_0))))
     add_extra_line(m_ea, True,
                    ";   512-byte trainer        : %s" % YES_NO(INES_MASK_TRAINER(hdr.rom_control_byte_0)))
     add_extra_line(m_ea, True,
