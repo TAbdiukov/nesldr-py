@@ -39,14 +39,14 @@ from nesldr.structs import *
 from nesldr.ioregs import *
 from nesldr.mappers import *
 import ida_netnode
-from ida_loader import file2base, FILEREG_PATCHABLE
+from ida_loader import file2base, FILEREG_PATCHABLE, get_file_type_name
 from ida_idp import ph, PLFM_6502, set_processor_type, SETPROC_LOADER_NON_FATAL
-from ida_kernwin import msg, warning
+from ida_kernwin import msg, warning, ask_yn, ASKBTN_YES, ASKBTN_CANCEL
 from ida_segment import add_segm, set_segm_addressing, getseg
 from ida_bytes import del_items, create_data, byte_flag, word_flag, set_cmt, get_word
 from ida_name import set_name
 from ida_entry import add_entry
-from ida_offset import op_offset
+from ida_offset import op_plain_offset
 from ida_lines import add_extra_line
 #from ida_idaapi import get_inf_structure  #Fix For IDA 9.0+
 from ida_nalt import get_root_filename
@@ -65,7 +65,7 @@ hdr = ines_hdr()
 
 def readinto(li, struct):
     buf = li.read(sizeof(struct))
-    if len(buf) != sizeof(struct):
+    if buf is None or len(buf) != sizeof(struct):
         return False
     else:
         memmove(addressof(struct), (buf), sizeof(struct))
@@ -91,7 +91,8 @@ def accept_file(li, path):
     li.seek(0)
 
     # read NES header
-    assert readinto(li, hdr)
+    if not readinto(li, hdr):
+        return 0
 
     # is it a valid ROM image in iNes format?
     if(hdr.id != b"NES" or hdr.term != 0x1A):
@@ -112,7 +113,9 @@ def load_file(li, _a, _b):
     # set processor to 6502
     if (ph.id != PLFM_6502):
         msg("Nintendo Entertainment System ROM detected: setting processor type to M6502.\n")
-        set_processor_type("M6502", SETPROC_LOADER_NON_FATAL)
+        if not set_processor_type("M6502", SETPROC_LOADER_NON_FATAL):
+            warning("Could not set processor type to M6502.\n")
+            return 0
 
     try:
         return load_ines_file(li)
@@ -147,19 +150,42 @@ def load_ines_file(li):
 
     # read the whole header
     if not readinto(li, hdr):
-        vloader_failure("File read error!", 0)
+        warning("File read error!\n")
+        return 0
+
+    if(hdr.id != b"NES" or hdr.term != 0x1A):
+        warning("Invalid iNES signature.\n")
+        return 0
+
+    if((hdr.rom_control_byte_1 & 0x0C) == 0x08):
+        warning("NES 2.0 images are not supported by this loader.\n"
+                "The header will not be modified.\n")
         return 0
 
     # check if header is corrupt
     # show a warning msg, but load the rom nonetheless
     if(hdr.is_corrupt_ines_hdr()):
         # warning("The iNES header seems to be corrupt.\nLoader might give inaccurate results!")
-        code = askyn_c(1, "The iNES header seems to be corrupt.\n"
+        code = ask_yn(ASKBTN_YES, "The iNES header seems to be corrupt.\n"
                        "The NES loader could produce wrong results!\n"
                        "Do you want to internally fix the header ?\n\n"
                        "(this will not affect the input file)")
-        if(code == 1):
-            fix_ines_hdr()
+        if(code == ASKBTN_CANCEL):
+            return 0
+        if(code == ASKBTN_YES):
+            hdr.fix_ines_hdr()
+
+    if(hdr.prg_page_count_16k == 0):
+        warning("A zero PRG-ROM page count is not supported by this loader.\n")
+        return 0
+
+    required_size = INES_HDR_SIZE + \
+        (TRAINER_SIZE if INES_MASK_TRAINER(hdr.rom_control_byte_0) else 0) + \
+        PRG_PAGE_SIZE * hdr.prg_page_count_16k + \
+        CHR_PAGE_SIZE * hdr.chr_page_count_8k
+    if(li.size() < required_size):
+        warning("The ROM image is shorter than the sizes declared in its header.\n")
+        return 0
 
     # create NES segments
     create_segments(li)
@@ -188,7 +214,7 @@ def load_ines_file(li):
 def create_filename_cmt():
     m_ea = idaapi.inf_get_min_ea()
     add_extra_line(m_ea, True, "File Name   : %s" % get_root_filename())
-    add_extra_line(m_ea, True, "Format      : %s" % idaapi.inf_get_filetype())
+    add_extra_line(m_ea, True, "Format      : %s" % get_file_type_name())
 
 
 # ----------------------------------------------------------------------
@@ -229,7 +255,7 @@ def create_sram_segment():
                        SRAM_START_ADDRESS + SRAM_SIZE, "SRAM", None) == 1
     msg("creating SRAM segment..%s" % ("ok!\n" if success else "failure!\n"))
     if(not success):
-        return
+        raise RuntimeError("Could not create SRAM segment.")
     set_segm_addressing(getseg(SRAM_START_ADDRESS), 0)
 
 
@@ -242,7 +268,7 @@ def create_ram_segment():
                        RAM_START_ADDRESS + RAM_SIZE, "RAM", None) == 1
     msg("creating RAM segment..%s" % ("ok!\n" if success else "failure!\n"))
     if(not success):
-        return
+        raise RuntimeError("Could not create RAM segment.")
     set_segm_addressing(getseg(RAM_START_ADDRESS), 0)
 
     # how do I properly initialize a segment ?
@@ -260,7 +286,7 @@ def create_ioreg_segment():
     msg("creating IO_REGS segment..%s" %
         ("ok!\n" if success else "failure!\n"))
     if(not success):
-        return
+        raise RuntimeError("Could not create IO_REGS segment.")
     set_segm_addressing(getseg(IOREGS_START_ADDRESS), 0)
 
     define_item(PPU_CR_1_ADDRESS, PPU_CR_1_SIZE,
@@ -348,7 +374,7 @@ def create_rom_segment():
                        ROM_START_ADDRESS + ROM_SIZE, "ROM", "CODE") == 1
     msg("creating ROM segment..%s" % ("ok!\n" if success else "failure!\n"))
     if(not success):
-        return
+        raise RuntimeError("Could not create ROM segment.")
     set_segm_addressing(getseg(ROM_START_ADDRESS), 0)
 
 
@@ -362,7 +388,7 @@ def create_exprom_segment():
     msg("creating EXP_ROM segment..%s" %
         ("ok!\n" if success else "failure!\n"))
     if(not success):
-        return
+        raise RuntimeError("Could not create EXP_ROM segment.")
     set_segm_addressing(getseg(EXPROM_START_ADDRESS), 0)
 
 
@@ -372,13 +398,10 @@ def create_exprom_segment():
 #      to TRAINER_START_ADDRESS
 #
 def load_trainer(li):
-    if(not INES_MASK_SRAM(hdr.rom_control_byte_0)):
-        success = add_segm(0, TRAINER_START_ADDRESS, TRAINER_START_ADDRESS +
-                           TRAINER_SIZE, "TRAINER", "CODE") == 1
-        msg("creating TRAINER segment..%s", "ok!\n" if success else "failure!\n")
-        set_segm_addressing(getseg(TRAINER_START_ADDRESS), 0)
-    li.file2base(INES_HDR_SIZE, TRAINER_START_ADDRESS,
-              TRAINER_START_ADDRESS + TRAINER_SIZE, FILEREG_PATCHABLE)
+    # create_sram_segment() already covers the trainer's address range.
+    if not li.file2base(INES_HDR_SIZE, TRAINER_START_ADDRESS,
+                       TRAINER_START_ADDRESS + TRAINER_SIZE, FILEREG_PATCHABLE):
+        raise RuntimeError("Could not load trainer.")
 
 
 # ----------------------------------------------------------------------
@@ -416,8 +439,8 @@ def load_chr_rom_bank(li, banknr, address):
 #
 def load_prg_rom_bank(li, banknr, address):
 
-    if((banknr == 0) or (hdr.prg_page_count_16k == 0)):
-        return
+    if not 1 <= banknr <= hdr.prg_page_count_16k:
+        raise ValueError("Invalid 16K PRG-ROM bank number: %d" % banknr)
 
     # this is the file offset to begin reading pages from
     offset = INES_HDR_SIZE + \
@@ -426,11 +449,11 @@ def load_prg_rom_bank(li, banknr, address):
 
     # load page from ROM file into segment
     msg("mapping PRG-ROM page %02d to %08x-%08x (file offset %08x) .." %
-        (1, address, address + PRG_ROM_BANK_SIZE, offset))
+        (banknr, address, address + PRG_ROM_BANK_SIZE, offset))
     if(li.file2base(offset, address, address + PRG_ROM_BANK_SIZE, FILEREG_PATCHABLE) == 1):
         msg("ok\n")
     else:
-        msg("failure (corrupt ROM image?)\n")
+        raise RuntimeError("Could not load 16K PRG-ROM bank %d." % banknr)
 
 
 # ----------------------------------------------------------------------
@@ -439,8 +462,8 @@ def load_prg_rom_bank(li, banknr, address):
 #
 def load_8k_prg_rom_bank(li, banknr, address):
 
-    if((banknr == 0) or (hdr.prg_page_count_16k == 0)):
-        return
+    if not 1 <= banknr <= hdr.prg_page_count_16k * 2:
+        raise ValueError("Invalid 8K PRG-ROM bank number: %d" % banknr)
 
     # this is the file offset to begin reading pages from
     offset = INES_HDR_SIZE + \
@@ -448,12 +471,12 @@ def load_8k_prg_rom_bank(li, banknr, address):
         (banknr - 1) * PRG_ROM_8K_BANK_SIZE
 
     # load page from ROM file into segment
-    msg("mapping 8k PRG-ROM page %02d to %08x-%08x (file offset %08x) ..",
-        1, address, address + PRG_ROM_8K_BANK_SIZE, offset)
-    if(file2base(li, offset, address, address + PRG_ROM_8K_BANK_SIZE, FILEREG_PATCHABLE) == 1):
+    msg("mapping 8k PRG-ROM page %02d to %08x-%08x (file offset %08x) .." %
+        (banknr, address, address + PRG_ROM_8K_BANK_SIZE, offset))
+    if(li.file2base(offset, address, address + PRG_ROM_8K_BANK_SIZE, FILEREG_PATCHABLE) == 1):
         msg("ok\n")
     else:
-        msg("failure (corrupt ROM image?)\n")
+        raise RuntimeError("Could not load 8K PRG-ROM bank %d." % banknr)
 
 
 # ----------------------------------------------------------------------
@@ -527,6 +550,10 @@ def load_rom_banks(li):
         warning("Mapper %d is not supported by this loader!\n"
                 "This could be a corrupt ROM image!\n"
                 "Loading first and last PRG-ROM banks by default." % mapper)
+        load_prg_rom_bank(li, 1, PRG_ROM_BANK_LOW_ADDRESS)
+        load_prg_rom_bank(li, hdr.prg_page_count_16k,
+                          PRG_ROM_BANK_HIGH_ADDRESS)
+        load_chr_rom_bank(li, 1, CHR_ROM_BANK_ADDRESS)
 
 
 # ----------------------------------------------------------------------
@@ -535,13 +562,17 @@ def load_rom_banks(li):
 #
 def save_image_as_blobs(li):
     # store ines header in a blob
-    save_ines_hdr_as_blob()
+    if not save_ines_hdr_as_blob():
+        raise RuntimeError("Could not store iNES header to netnode.")
 
-    save_trainer_as_blob(li)
+    if INES_MASK_TRAINER(hdr.rom_control_byte_0) and not save_trainer_as_blob(li):
+        raise RuntimeError("Could not store trainer to netnode.")
 
     # store rom image in blobs
-    save_prg_rom_pages_as_blobs(li, hdr.prg_page_count_16k)
-    save_chr_rom_pages_as_blobs(li, hdr.chr_page_count_8k)
+    if not save_prg_rom_pages_as_blobs(li, hdr.prg_page_count_16k):
+        raise RuntimeError("Could not store PRG-ROM pages to netnode.")
+    if not save_chr_rom_pages_as_blobs(li, hdr.chr_page_count_8k):
+        raise RuntimeError("Could not store CHR-ROM pages to netnode.")
 
 
 # ----------------------------------------------------------------------
@@ -570,10 +601,13 @@ def save_trainer_as_blob(li):
 
     li.seek(INES_HDR_SIZE)
     buffer = li.read(TRAINER_SIZE)
+    if buffer is None or len(buffer) != TRAINER_SIZE:
+        return False
     if(not node.create("$ Trainer")):
         return False
-    if(not node.setblob(buffer, TRAINER_SIZE, 0, 'I')):
+    if(not node.setblob(buffer, 0, 'I')):
         msg("Could not store trainer to netnode!\n")
+        return False
 
     return True
 
@@ -585,16 +619,19 @@ def save_trainer_as_blob(li):
 def save_prg_rom_pages_as_blobs(li, count):
     node = ida_netnode.netnode()
 
-    li.seek(TRAINER_SIZE if INES_HDR_SIZE +
-            (INES_MASK_TRAINER(hdr.rom_control_byte_0)) else 0)
+    li.seek(INES_HDR_SIZE +
+            (TRAINER_SIZE if INES_MASK_TRAINER(hdr.rom_control_byte_0) else 0))
 
     for i in range(count):
         buffer = li.read(PRG_PAGE_SIZE)
+        if buffer is None or len(buffer) != PRG_PAGE_SIZE:
+            return False
         prg_node_name = "$ PRG-ROM page %d" % i
         if(not node.create(prg_node_name)):
             return False
         if(not node.setblob(buffer, 0, 'I')):
             msg("Could not store PRG-ROM pages to netnode!\n")
+            return False
 
     return True
 
@@ -611,11 +648,14 @@ def save_chr_rom_pages_as_blobs(li, count):
 
     for i in range(count):
         buffer = li.read(CHR_PAGE_SIZE)
+        if buffer is None or len(buffer) != CHR_PAGE_SIZE:
+            return False
         chr_node_name = "$ CHR-ROM page %d" % i
         if(not node.create(chr_node_name)):
             return False
         if(not node.setblob(buffer, 0, 'I')):
             msg("Could not store CHR-ROM pages to netnode!\n")
+            return False
 
     return True
 
@@ -690,7 +730,7 @@ def get_vector(vec):
 def name_vector(address, name):
     del_items(address, True)
     create_data(address, word_flag(), 2, ida_netnode.BADNODE)
-    op_offset(address, 0, 0)
+    op_plain_offset(address, 0, 0)
     set_name(address, name)
 
 

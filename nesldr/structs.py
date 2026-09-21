@@ -117,7 +117,7 @@ class ines_hdr(Structure):
         ('rom_control_byte_1', c_ubyte),
         # not used by this loader currently
         ('ram_bank_count_8k', c_ubyte),
-        # should all be zero (not checked by loader)
+        # bytes 9-10 have legacy flag uses; bytes 11-15 are padding
         ('reserved', c_ubyte * 7),
     ]
 
@@ -126,19 +126,20 @@ class ines_hdr(Structure):
     #      check if ROM image header is corrupt
     #
     def is_corrupt_ines_hdr(self):
-        return any(_ != 0 for _ in self.reserved)
+        return any(_ != 0 for _ in self.reserved[2:])
 
     # ----------------------------------------------------------------------
     #
     #      fix iNES header internally
     #
 
-    def fix_ines_hdr(void):
-        diskdude = b"DiskDude\x00"
-
-        if(self.rom_control_byte_1[0] == diskdude[0] and self.ram_bank_count_8k == diskdude[1] and self.reserved == diskdude[2:]):
-            self.rom_control_byte_1[:] = b'\x00' * 9
-        self.reserved[:] = b'\x00' * sizeof(self.reserved)
+    def fix_ines_hdr(self):
+        if(bytes(self)[7:] in (b"DiskDude!", b"DiskDude\x00")):
+            self.rom_control_byte_1 = 0
+            self.ram_bank_count_8k = 0
+            self.reserved[0] = 0
+            self.reserved[1] = 0
+        self.reserved[2:] = b'\x00' * (sizeof(self.reserved) - 2)
         return
 
 
